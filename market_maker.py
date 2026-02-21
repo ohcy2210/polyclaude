@@ -42,9 +42,14 @@ class PolymarketClient:
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """Lazy singleton: create one persistent HTTP session."""
+        """Lazy singleton: create one persistent HTTP session with TCP_NODELAY."""
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            import socket
+            connector = aiohttp.TCPConnector(
+                # Disable Nagle's algorithm — send packets immediately
+                socket_options=[(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)],
+            )
+            self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
     async def close(self):
@@ -166,8 +171,8 @@ class PolymarketClient:
         size = int(size)  # strict integer shares
         clob_side = BUY if side.upper() == "BUY" else SELL
 
-        logger.info(
-            f"Placing order: {side} {size:.2f} shares @ {price:.4f} "
+        logger.debug(
+            f"Placing order: {side} {size} shares @ {price:.4f} "
             f"(token {token_id[:12]}…)"
         )
 
@@ -176,7 +181,7 @@ class PolymarketClient:
             resp = await asyncio.to_thread(
                 self._place_order_sync, token_id, clob_side, price, size
             )
-            logger.info(f"Order response: {resp}")
+            logger.debug(f"Order response: {resp}")
             return resp
 
         except Exception as e:
@@ -207,14 +212,14 @@ class PolymarketClient:
         """
         if size <= 0:
             return None
-        logger.info(
-            f"📝 GTC SELL {size} shares @ {price:.2f} (token {token_id[:12]}…)"
+        logger.debug(
+            f"GTC SELL {size} shares @ {price:.2f} (token {token_id[:12]}…)"
         )
         try:
             resp = await asyncio.to_thread(
                 self._place_gtc_sell_sync, token_id, price, int(size)
             )
-            logger.info(f"GTC sell response: {resp}")
+            logger.debug(f"GTC sell response: {resp}")
             return resp
         except Exception as e:
             logger.error(f"GTC sell placement failed: {e}", exc_info=True)
@@ -303,6 +308,33 @@ class PolymarketClient:
             parts = [f"{k}={v:.4f}" for k, v in ask_map.items()]
             logger.info(f"📊 Live asks: {' '.join(parts)}")
         return ask_map, bid_map
+
+    # ── Position Discovery ─────────────────────────────────────────────
+
+    async def get_open_positions(self) -> list[dict]:
+        """
+        Fetch all open positions for this account from the Polymarket API.
+
+        Returns a list of position dicts, each containing:
+          - asset (token_id)
+          - size (number of shares held)
+          - avgPrice (average entry price)
+          - side (BUY direction)
+        """
+        session = await self._get_session()
+        try:
+            url = f"{config.CLOB_HOST}/positions"
+            headers = self.client.create_l2_headers()
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Positions API returned {resp.status}")
+                    return []
+                data = fast_loads(await resp.read())
+                # Filter for positions with non-zero size
+                return [p for p in data if float(p.get("size", 0)) > 0]
+        except Exception as e:
+            logger.error(f"Failed to fetch positions: {e}")
+            return []
 
     # ── Market Discovery ────────────────────────────────────────────────
 
