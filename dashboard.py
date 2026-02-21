@@ -31,7 +31,7 @@ import config
 
 # ─── Trade record for history ──────────────────────────────────────────────
 
-@dataclass
+@dataclass(slots=True)
 class TradeRecord:
     """Single completed trade for the history panel."""
     side: str            # "Up" or "Down"

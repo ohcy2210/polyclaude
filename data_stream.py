@@ -5,6 +5,7 @@ BinanceStream: Connects to Binance aggTrade for tick-by-tick BTC prices.
 
 import asyncio
 import logging
+import socket
 import time
 from typing import Callable, Awaitable
 
@@ -51,7 +52,15 @@ class BinanceStream:
                     ping_timeout=5,
                     close_timeout=3,
                 ) as ws:
-                    logger.info("Connected to Binance aggTrade stream")
+                    # Disable Nagle's algorithm for zero-buffering
+                    transport = ws.transport
+                    if transport is not None:
+                        sock = transport.get_extra_info("socket")
+                        if sock is not None:
+                            sock.setsockopt(
+                                socket.IPPROTO_TCP, socket.TCP_NODELAY, 1
+                            )
+                    logger.info("Connected to Binance aggTrade stream (TCP_NODELAY)")
                     await self._consume(ws)
             except (
                 websockets.ConnectionClosedError,

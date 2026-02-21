@@ -17,7 +17,95 @@ from typing import Optional
 import config
 
 # ────────────────────────────────────────────────────────────────────────────
-# 1.  compute_micro_vol
+# 1a.  IncrementalVol — O(1) rolling micro-volatility
+# ────────────────────────────────────────────────────────────────────────────
+
+class IncrementalVol:
+    """
+    O(1) rolling micro-volatility over 1-second log-return bars.
+
+    Maintains a circular buffer of the last *window* 1-second bar prices.
+    On each ``update(price, timestamp)`` call, the current second's bar
+    is updated (last-price-wins).  When a new second rolls over, the
+    log-return from the previous bar is pushed into the rolling statistics
+    and the oldest return is evicted.
+
+    ``get_vol()`` returns the sample standard deviation of the buffered
+    log-returns in O(1) via Welford's online algorithm.
+    """
+
+    __slots__ = (
+        "_window", "_bar_prices", "_bar_seconds",
+        "_log_rets", "_head", "_count",
+        "_sum", "_sum_sq", "_last_sec", "_last_price",
+    )
+
+    def __init__(self, window: int = 60):
+        self._window = window
+        # Circular buffers for bar prices and their log-returns
+        self._bar_prices: list[float] = [0.0] * (window + 1)
+        self._bar_seconds: list[int] = [0] * (window + 1)
+        self._log_rets: list[float] = [0.0] * window
+        self._head = 0        # write cursor in _log_rets
+        self._count = 0       # number of valid returns stored
+        # Running Welford accumulators
+        self._sum = 0.0
+        self._sum_sq = 0.0
+        # State for bar aggregation
+        self._last_sec: int = 0
+        self._last_price: float = 0.0
+
+    def update(self, price: float, timestamp: float) -> None:
+        """Ingest a tick.  Amortised O(1) per call."""
+        sec = int(timestamp)
+
+        if self._last_sec == 0:
+            # First tick ever — seed state
+            self._last_sec = sec
+            self._last_price = price
+            return
+
+        if sec == self._last_sec:
+            # Same second — just update the bar's close price
+            self._last_price = price
+            return
+
+        # New second boundary — commit a log-return
+        if self._last_price > 0 and price > 0:
+            lr = math.log(price / self._last_price)
+        else:
+            lr = 0.0
+
+        # Evict oldest return if buffer is full
+        if self._count >= self._window:
+            old = self._log_rets[self._head]
+            self._sum -= old
+            self._sum_sq -= old * old
+        else:
+            self._count += 1
+
+        # Insert new return
+        self._log_rets[self._head] = lr
+        self._sum += lr
+        self._sum_sq += lr * lr
+        self._head = (self._head + 1) % self._window
+
+        self._last_sec = sec
+        self._last_price = price
+
+    def get_vol(self) -> float:
+        """Return the sample stdev of buffered log-returns.  O(1)."""
+        if self._count < 2:
+            return 0.0
+        mean = self._sum / self._count
+        var = (self._sum_sq / self._count) - (mean * mean)
+        # Bessel's correction for sample variance
+        var = var * self._count / (self._count - 1)
+        return math.sqrt(max(0.0, var))
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# 1b.  compute_micro_vol  (legacy — kept for backtester compatibility)
 # ────────────────────────────────────────────────────────────────────────────
 
 def compute_micro_vol(tick_deque: deque) -> float:
@@ -208,6 +296,48 @@ class StrategyEngine:
         """
         self.ticks = tick_deque
         self.current_tier_idx = 0  # stepwise bet tier
+        self.incr_vol = IncrementalVol(window=60)  # O(1) rolling volatility
+        # O(1) velocity buffer — stores (price, timestamp) at 1-second intervals
+        self._velocity_buffer: deque = deque(maxlen=10)
+        self._velocity_last_sec: int = 0
+
+    # ── O(1) velocity buffer management ─────────────────────────────────
+
+    def update_tick(self, price: float, timestamp: float) -> None:
+        """
+        Called on every Binance tick.  Updates the incremental vol tracker
+        and the 1-second velocity buffer in O(1).
+        """
+        self.incr_vol.update(price, timestamp)
+
+        sec = int(timestamp)
+        if sec != self._velocity_last_sec:
+            self._velocity_buffer.append((price, timestamp))
+            self._velocity_last_sec = sec
+
+    def _get_velocity(self, lookback: int = 3) -> float:
+        """
+        O(1) absolute dollar change over the last *lookback* seconds
+        using the secondary velocity buffer (1 sample/second, maxlen=10).
+        """
+        buf = self._velocity_buffer
+        if len(buf) < 2:
+            return 0.0
+
+        latest_price, latest_ts = buf[-1]
+        cutoff_ts = latest_ts - lookback
+
+        # Walk the small buffer (≤10 entries) backwards
+        ref_price: Optional[float] = None
+        for i in range(len(buf) - 1, -1, -1):
+            if buf[i][1] <= cutoff_ts:
+                ref_price = buf[i][0]
+                break
+
+        if ref_price is None:
+            ref_price = buf[0][0]
+
+        return abs(latest_price - ref_price)
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -234,14 +364,14 @@ class StrategyEngine:
             A ``Signal`` if edge > MIN_EDGE and no toxic flow,
             otherwise ``None``.
         """
-        # ── 0. Micro-volatility (needed for probability) ───────────────
-        vol = compute_micro_vol(self.ticks)
+        # ── 0. Micro-volatility (O(1) incremental) ────────────────────
+        vol = self.incr_vol.get_vol()
         if vol <= 0.0:
             # Not enough data to price — stay flat
             return None
 
-        # ── 1. Tick velocity (used for momentum AND toxic-flow gate) ───
-        velocity = compute_tick_velocity(self.ticks, lookback=TOXIC_LOOKBACK)
+        # ── 1. Tick velocity (O(1) from secondary buffer) ────────────
+        velocity = self._get_velocity(lookback=TOXIC_LOOKBACK)
         # Signed direction: positive = price rising, negative = falling
         if len(self.ticks) >= 2:
             signed_move = self.ticks[-1][0] - self.ticks[-2][0]

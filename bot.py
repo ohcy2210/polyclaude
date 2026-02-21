@@ -55,6 +55,22 @@ class TradingBot:
       6. Repeat.  Periodically re-discover markets for the next window.
     """
 
+    __slots__ = (
+        "ticks", "poly", "engine", "stream",
+        "active_market", "position", "_running",
+        "window_start_price", "_placing_order", "_exiting_order",
+        "_skip_first_window", "_startup_market_cid",
+        "_trades_this_window", "_last_exit_time",
+        "total_pnl", "wins", "losses", "trades",
+        "dash_state", "dashboard", "_tick_counter",
+        "journal", "_active_trade_id",
+        "active_market_end_ts",
+        # Basis tracker (Step 2)
+        "basis_offset", "basis_history",
+        # Circuit breaker (Step 4b)
+        "_circuit_breaker_until",
+    )
+
     def __init__(self):
         # Shared tick buffer — (price, unix_ts)
         self.ticks: deque = deque(maxlen=120)
@@ -93,6 +109,83 @@ class TradingBot:
         self.journal = TradeJournal()
         self._active_trade_id: Optional[str] = None
 
+        # Basis tracker — aligns Binance feed to Polymarket oracle settlement
+        self.basis_offset: float = 0.0
+        self.basis_history: deque = deque(maxlen=60)  # 60-second moving average
+
+        # Circuit breaker — blocks entries during WebSocket lag
+        self._circuit_breaker_until: float = 0.0
+
+    # ─── Startup position recovery ─────────────────────────────────────
+
+    async def _sync_positions_on_startup(self):
+        """
+        Cold boot recovery: check for open positions on the active 5-min
+        market. If found, populate self.position and self._active_trade_id
+        so the bot can manage the exit without "losing" the position.
+        """
+        try:
+            mkt = await self.poly.get_5min_btc_market()
+            if not mkt:
+                logger.info("No active market at startup — skipping position sync")
+                return
+
+            token_map = mkt.get("token_map", {})
+            if not token_map:
+                return
+
+            positions = await self.poly.get_open_positions()
+            if not positions:
+                logger.info("No open positions at startup")
+                return
+
+            # Check if any position matches the current 5-min market's tokens
+            token_to_side = {tid: side for side, tid in token_map.items()}
+            for pos in positions:
+                asset = pos.get("asset", "")
+                if asset in token_to_side:
+                    side = token_to_side[asset]
+                    size = float(pos.get("size", 0))
+                    avg_price = float(pos.get("avgPrice", 0))
+                    if size > 0 and avg_price > 0:
+                        usdc_risked = size * avg_price
+                        self.position = OpenPosition(
+                            side=side,
+                            average_entry_price=avg_price,
+                            size_usdc=usdc_risked,
+                            shares=size,
+                        )
+                        self.active_market = mkt
+                        # Parse end_date for time_left
+                        end_str = mkt.get("end_date", "")
+                        if end_str:
+                            from datetime import datetime, timezone
+                            end_dt = datetime.fromisoformat(
+                                end_str.replace("Z", "+00:00")
+                            )
+                            self.active_market_end_ts = end_dt.timestamp()
+                        # Generate a synthetic trade_id for journal tracking
+                        import uuid
+                        self._active_trade_id = f"recovered-{uuid.uuid4().hex[:8]}"
+
+                        # Update dashboard
+                        self.dash_state.position_side = side
+                        self.dash_state.position_entry = avg_price
+                        self.dash_state.position_size = usdc_risked
+                        self.dash_state.market_question = mkt.get("question", "?")
+                        self.dash_state.market_end_date = end_str
+
+                        logger.info(
+                            f"🔄 RECOVERED position: {side} "
+                            f"{size:.0f} shares @ ${avg_price:.4f} "
+                            f"(${usdc_risked:.2f} risked)"
+                        )
+                        return
+
+            logger.info("No matching position for current 5-min market")
+        except Exception as e:
+            logger.error(f"Position sync failed: {e}", exc_info=True)
+
     # ─── Main entry point ──────────────────────────────────────────────
 
     async def run(self):
@@ -107,6 +200,9 @@ class TradingBot:
 
         # Cancel any stale orders from previous runs (e.g. unfilled GTC orders)
         await self.poly.cancel_all()
+
+        # Cold boot recovery: check for existing positions
+        await self._sync_positions_on_startup()
 
         # Start dashboard
         self.dashboard.start()
@@ -143,6 +239,21 @@ class TradingBot:
         ts = timestamp_ms / 1000.0          # ms → seconds
         self.ticks.append((price, ts))
 
+        # ── Circuit breaker: detect WebSocket lag ────────────────────
+        tick_age = time.time() - ts
+        if tick_age > 0.5:
+            logger.critical(
+                f"⚠️ CIRCUIT BREAKER: tick {tick_age*1000:.0f}ms stale — "
+                f"blocking entries for 5s"
+            )
+            self._circuit_breaker_until = time.time() + 5.0
+            return  # drop this stale tick entirely
+
+        # O(1) incremental updates for vol + velocity
+        # Apply basis offset to align Binance price with Polymarket oracle
+        adjusted_price = price + self.basis_offset
+        self.engine.update_tick(adjusted_price, ts)
+
         # Update dashboard BTC price on every tick
         self.dash_state.btc_price = price
 
@@ -173,13 +284,13 @@ class TradingBot:
         # ── Expiry check — did the 5-min window just end? ──────────────
         time_left = self._time_left(self.active_market)
         if time_left <= 0:
-            await self._settle_market(price)
+            await self._settle_market(adjusted_price)
             return
 
         # ── Exit check (if we hold a position) ─────────────────────────
         if self.position is not None:
             if not self._exiting_order:
-                await self._maybe_exit(price)
+                await self._maybe_exit(adjusted_price)
             return  # don't open a new position while holding one
 
         # ── Safety: block if an order is already in flight ─────────────
@@ -203,8 +314,12 @@ class TradingBot:
         if self._last_exit_time > 0 and (time.time() - self._last_exit_time) < 5.0:
             return
 
+        # ── Circuit breaker cooldown (stale ticks detected) ──────────
+        if time.time() < self._circuit_breaker_until:
+            return
+
         # ── Signal generation ──────────────────────────────────────────
-        await self._maybe_enter(price)
+        await self._maybe_enter(adjusted_price)
 
     # ─── Entry logic ───────────────────────────────────────────────────
 
@@ -673,6 +788,8 @@ class TradingBot:
             self.window_start_price = None
             self._trades_this_window = 0  # reset trade counter for new window
             self._last_exit_time = 0.0    # reset cooldown
+            self.basis_offset = 0.0       # reset basis for new window
+            self.basis_history.clear()
             # Clear dashboard
             self.dash_state.position_side = None
             self.dash_state.position_status = "—"
@@ -801,6 +918,26 @@ class TradingBot:
                             # Update live bids for active trade display
                             self.dash_state.up_bid = bid_map.get("Up")
                             self.dash_state.down_bid = bid_map.get("Down")
+
+                            # ── Basis tracker: align Binance to Polymarket oracle ──
+                            yes_bid = bid_map.get("Up")
+                            yes_ask = ask_map.get("Up")
+                            if (
+                                yes_bid is not None
+                                and yes_ask is not None
+                                and self.window_start_price is not None
+                                and self.dash_state.btc_price > 0
+                            ):
+                                implied_btc = (
+                                    (yes_bid + yes_ask) / 2.0 * 100.0
+                                    + self.window_start_price
+                                )
+                                current_basis = implied_btc - self.dash_state.btc_price
+                                self.basis_history.append(current_basis)
+                                # 60-second moving average
+                                self.basis_offset = (
+                                    sum(self.basis_history) / len(self.basis_history)
+                                )
                         except Exception as e:
                             logger.error(f"Live price fetch failed: {e}")
                     self.dash_state.up_price = self._get_up_price(mkt)

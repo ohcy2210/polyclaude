@@ -31,7 +31,7 @@ JOURNAL_DIR = Path(__file__).parent / "journals"
 JOURNAL_DIR.mkdir(exist_ok=True)
 
 
-@dataclass
+@dataclass(slots=True)
 class JournalEntry:
     """Complete record of a single trade."""
 
